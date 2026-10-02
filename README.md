@@ -33,7 +33,7 @@ so `hermes update` does not break it. Once an upstream feature lands, you can un
 | `hermes send` | The visible ⏸️ / ▶️ notices (the injected text itself is agent input and never shows in the chat). |
 
 - Pending resumes persist in `$HERMES_HOME/state/ratelimit-resume.json`, so a gateway restart keeps them.
-- A small waker thread checks every 15s. It runs only in the `hermes gateway run` process.
+- A small waker thread checks every 60s. It runs only in the `hermes gateway run` process.
 - Resets shorter than 10 minutes are left to Hermes' own retry (it already waits up to 600s).
   Resets longer than `max_wait_hours` (default 6h — i.e. weekly windows) are left alone.
 

@@ -38,7 +38,7 @@ NON_GATEWAY_PLATFORMS = {"", "cli", "cron", "tui", "desktop", "dashboard", "api"
 # Post visible ⏸️/▶️ notices in the chat via `hermes send`.
 NOTICES = True
 # How often the waker thread checks for due resumes.
-TICK_SECONDS = 15
+TICK_SECONDS = 60
 # A due resume whose injection keeps failing is dropped after this long.
 GIVE_UP_AFTER_SECONDS = 900
 # How old a reset stashed by the classification hook may be when the error hook reads it.
