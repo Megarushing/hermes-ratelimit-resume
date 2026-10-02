@@ -142,8 +142,12 @@ def lookup_target(session_key: str) -> Optional[str]:
 
 
 def hermes_bin() -> Optional[str]:
-    launcher = hermes_home() / "hermes-agent" / ".hermes" / "bin" / "hermes"
-    return str(launcher) if launcher.exists() else shutil.which("hermes")
+    # Profiles (HERMES_HOME=~/.hermes/profiles/<name>) share the root install's launcher.
+    for root in (hermes_home(), Path.home() / ".hermes"):
+        launcher = root / "hermes-agent" / ".hermes" / "bin" / "hermes"
+        if launcher.exists():
+            return str(launcher)
+    return shutil.which("hermes")
 
 
 def send_notice(session_key: str, text: str) -> None:
