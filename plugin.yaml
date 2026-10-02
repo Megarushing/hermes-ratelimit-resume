@@ -1,0 +1,24 @@
+name: ratelimit-resume
+version: 1.0.0
+manifest_version: 2
+api_version: 1
+description: Auto-continue a messaging-gateway chat when a provider usage limit resets.
+kind: standalone
+license: MIT
+homepage: https://github.com/Megarushing/hermes-ratelimit-resume
+tags: [gateway, rate-limit, codex, discord, telegram, slack]
+provides_hooks:
+  - transform_api_error_classification
+  - api_request_error
+  - post_api_request
+  - pre_gateway_dispatch
+provides_commands:
+  - ratelimit-test
+  - ratelimit-status
+config_schema:
+  platforms: {type: list, default: [], description: "Gateway platforms to auto-continue (e.g. [discord, telegram]). Empty = all messaging platforms."}
+  max_wait_hours: {type: float, default: 6, description: "Longest reset to wait for. Longer (e.g. weekly) limits are left alone."}
+  min_wait_seconds: {type: int, default: 600, description: "Shorter resets are left to Hermes' own retry, which already waits up to 600s."}
+  margin_seconds: {type: int, default: 60, description: "Continue this many seconds after the provider's stated reset."}
+  notices: {type: bool, default: true, description: "Post visible ⏸️/▶️ notices in the chat via `hermes send`."}
+  resume_message: {type: str, default: "Rate limit reset — continue where you stopped. Start your reply with \"▶️ *auto-continued*\".", description: "Text injected into the agent at wake-up (the chat never shows it)."}
