@@ -15,6 +15,7 @@ def register(ctx) -> None:
                            settings=Settings(ctx.get_config))
     ctx.register_hook("transform_api_error_classification", _PLUGIN.on_classify)
     ctx.register_hook("api_request_error", _PLUGIN.on_api_error)
+    ctx.register_hook("pre_llm_call", _PLUGIN.on_turn_start)
     ctx.register_hook("post_api_request", _PLUGIN.on_api_success)
     ctx.register_hook("pre_gateway_dispatch", _PLUGIN.on_gateway_dispatch)
     ctx.register_command("ratelimit-test", _PLUGIN.cmd_test,

@@ -1,5 +1,5 @@
 name: ratelimit-resume
-version: 1.0.0
+version: 1.0.1
 manifest_version: 2
 api_version: 1
 description: Auto-continue a messaging-gateway chat when a provider usage limit resets.
@@ -11,10 +11,8 @@ provides_hooks:
   - transform_api_error_classification
   - api_request_error
   - post_api_request
+  - pre_llm_call
   - pre_gateway_dispatch
-provides_commands:
-  - ratelimit-test
-  - ratelimit-status
 config_schema:
   platforms: {type: list, default: [], description: "Gateway platforms to auto-continue (e.g. [discord, telegram]). Empty = all messaging platforms."}
   max_wait_hours: {type: float, default: 6, description: "Longest reset to wait for. Longer (e.g. weekly) limits are left alone."}

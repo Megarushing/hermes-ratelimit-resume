@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -39,7 +40,9 @@ NON_GATEWAY_PLATFORMS = {"", "cli", "cron", "tui", "desktop", "dashboard", "api"
 NOTICES = True
 # How often the waker thread checks for due resumes.
 TICK_SECONDS = 60
-# A due resume whose injection keeps failing is dropped after this long.
+# A scheduled injection is not a dispatch receipt. Retry unacknowledged submissions.
+ACK_WAIT_SECONDS = 120
+# Stop automatic attempts after this long, but retain a visible blocked record.
 GIVE_UP_AFTER_SECONDS = 900
 # How old a reset stashed by the classification hook may be when the error hook reads it.
 STASH_MAX_AGE_SECONDS = 30
@@ -51,10 +54,12 @@ RESUME_MESSAGE = ("Rate limit reset — continue where you stopped. "
 # Visible chat notices, posted as the bot via the public `hermes send` CLI.
 PARKED_NOTICE = "⏸️ Rate limited — I'll auto-continue at {when}."
 RESUMED_NOTICE = "▶️ Rate limit reset — auto-continuing now."
+BLOCKED_NOTICE = "⚠️ Automatic continuation could not be confirmed. The pending request is saved; check /ratelimit-status or continue manually."
 # A re-arm moving the wake-up by less than this does not post a new parked notice.
 RENOTIFY_SHIFT_SECONDS = 300
 SEND_TIMEOUT_SECONDS = 60
 TEST_SUFFIX = "#test"
+_RECEIPT = re.compile(r"\n\[ratelimit-resume:([0-9a-f]{32})\]$")
 
 _RESETS_IN_SECONDS_FIELD = re.compile(r"resets_in_seconds\W{1,4}(\d+(?:\.\d+)?)", re.I)
 _RESETS_AT_FIELD = re.compile(r"resets_at\W{1,4}(\d{9,11}(?:\.\d+)?)", re.I)
@@ -141,6 +146,14 @@ def lookup_target(session_key: str) -> Optional[str]:
     return f"{platform}:{chat}:{thread}" if thread else f"{platform}:{chat}"
 
 
+def lookup_session_id(session_key: str) -> Optional[str]:
+    try:
+        value = json.loads((hermes_home() / "sessions" / "sessions.json").read_text())[session_key]
+        return value.get("session_id") or None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def hermes_bin() -> Optional[str]:
     # Profiles (HERMES_HOME=~/.hermes/profiles/<name>) share the root install's launcher.
     for root in (hermes_home(), Path.home() / ".hermes"):
@@ -200,6 +213,8 @@ class Store:
                 "wake_at": wake_at,
                 "armed_at": time.time(),
                 "reason": reason,
+                "status": "waiting",
+                "attempt_id": uuid.uuid4().hex,
             }
             self.save(data)
             return previous
@@ -295,13 +310,15 @@ class ResumePlugin:
             logger.info("ratelimit-resume: %s rate-limited with no reset time; not parking", session_id)
             return
         wait = reset_at - now
-        if wait <= self.s.min_wait:
+        key = lookup_session_key(session_id)
+        with self.store.lock:
+            already_pending = bool(key and key in self.store.load())
+        if wait <= self.s.min_wait and not already_pending:
             return
         if wait > self.s.max_wait:
             logger.info("ratelimit-resume: %s reset in %.1fh exceeds cap; not parking",
                         session_id, wait / 3600)
             return
-        key = lookup_session_key(session_id)
         if not key:
             logger.warning("ratelimit-resume: no session_key for %s; not parking", session_id)
             return
@@ -312,15 +329,86 @@ class ResumePlugin:
         logger.info("ratelimit-resume: parked %s until %s", key,
                     time.strftime("%H:%M:%S", time.localtime(wake_at)))
 
-    def on_api_success(self, *, session_id: str = "", **_: Any) -> None:
+    def on_turn_start(self, *, session_id: str = "", user_message: Any = "",
+                      turn_id: str = "", task_id: str = "", **_: Any) -> None:
+        """Bind a received continuation to its agent turn, not an older busy turn."""
         if not self.gateway or not session_id:
             return
-        for key in self.store.cancel_session_id(session_id):
-            logger.info("ratelimit-resume: %s answered again; dropped pending resume", key)
+        matches = re.findall(r"\[ratelimit-resume:([0-9a-f]{32})\]", str(user_message or ""))
+        with self.store.lock:
+            data = self.store.load()
+            changed = False
+            for key in list(data):
+                entry = data[key]
+                if entry.get("session_id") != session_id:
+                    continue
+                if not matches:
+                    # Fresh human work supersedes auto-work, not a deliberate test slot.
+                    if not key.endswith(TEST_SUFFIX):
+                        del data[key]
+                        changed = True
+                elif (entry.get("attempt_id") in matches and entry.get("status") == "dispatched"
+                      and (turn_id or task_id)):
+                    entry.update(status="running", turn_id=turn_id, task_id=task_id)
+                    changed = True
+            if changed:
+                self.store.save(data)
 
-    def on_gateway_dispatch(self, *, event: Any = None, session_store: Any = None, **_: Any) -> None:
-        """Remember which chat typed /ratelimit-test (command handlers get no session)."""
+    def on_api_success(self, *, session_id: str = "", turn_id: str = "",
+                       task_id: str = "", **_: Any) -> None:
+        if not self.gateway or not session_id:
+            return
+        with self.store.lock:
+            data = self.store.load()
+            completed = {}
+            for key, entry in data.items():
+                if entry.get("session_id") != session_id:
+                    continue
+                bound = bool(entry.get("turn_id") or entry.get("task_id"))
+                if bound:
+                    if ((entry.get("turn_id") and entry["turn_id"] != turn_id)
+                            or (entry.get("task_id") and entry["task_id"] != task_id)):
+                        continue
+                elif entry.get("status") == "dispatched" or key.endswith(TEST_SUFFIX):
+                    continue
+                completed[key] = entry
+            for key in completed:
+                del data[key]
+            if completed:
+                self.store.save(data)
+        for key, entry in completed.items():
+            if entry.get("turn_id") or entry.get("task_id"):
+                target = key.removesuffix(TEST_SUFFIX)
+                logger.info("ratelimit-resume: confirmed API progress for %s", target)
+                self.notify(target, RESUMED_NOTICE)
+            else:
+                logger.info("ratelimit-resume: %s answered again; cancelled pending resume", key)
+
+    def on_gateway_dispatch(self, *, event: Any = None, session_store: Any = None, **_: Any) -> Optional[dict]:
+        """Observe receipt of our exact attempt, or remember the test command's chat."""
         text = str(getattr(event, "text", "") or "").strip()
+        metadata = getattr(event, "metadata", None)
+        receipt = _RECEIPT.search(text)
+        if (receipt and getattr(event, "internal", False) is True
+                and isinstance(metadata, dict)
+                and metadata.get("hermes_plugin_id") == "ratelimit-resume"
+                and metadata.get("hermes_plugin_injection") is True):
+            target = metadata.get("gateway_session_key")
+            session_id = metadata.get("gateway_session_id")
+            with self.store.lock:
+                data = self.store.load()
+                found = [(k, v) for k, v in data.items()
+                         if k.removesuffix(TEST_SUFFIX) == target
+                         and v.get("attempt_id") == receipt.group(1)]
+                if not found:
+                    return {"action": "skip", "reason": "rate-limit continuation superseded"}
+                key, entry = found[0]
+                if entry.get("session_id") != session_id:
+                    return {"action": "skip", "reason": "rate-limit continuation session changed"}
+                entry["status"] = "dispatched"
+                entry["dispatched_at"] = time.time()
+                self.store.save(data)
+            return None
         if not text.startswith("/ratelimit-test"):
             return None
         source = getattr(event, "source", None)
@@ -344,7 +432,10 @@ class ResumePlugin:
         if not key:
             return "Could not find this chat's session key; test not armed."
         # Own slot, so a test never replaces a real pending resume for the same chat.
-        self.store.arm(key + TEST_SUFFIX, "test", time.time() + TEST_DELAY_SECONDS, "test")
+        session_id = lookup_session_id(key)
+        if not session_id:
+            return "Could not find this chat's session id; test not armed."
+        self.store.arm(key + TEST_SUFFIX, session_id, time.time() + TEST_DELAY_SECONDS, "test")
         return f"Test armed: this chat gets \"{self.s.resume_message}\" in {TEST_DELAY_SECONDS}s."
 
     def cmd_status(self, raw_args: str = "") -> str:
@@ -356,36 +447,61 @@ class ResumePlugin:
         lines = []
         for key, v in sorted(data.items(), key=lambda kv: kv[1].get("wake_at", 0)):
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(v.get("wake_at", 0)))
-            lines.append(f"- {key} → {when} ({v.get('reason')})")
+            lines.append(f"- {key} → {when} ({v.get('reason')}, {v.get('status', 'waiting')})")
         return "Pending rate-limit resumes:\n" + "\n".join(lines)
 
     # --- waker -----------------------------------------------------------
     def tick(self, now: Optional[float] = None) -> None:
+        if not self.gateway:
+            return
         now = time.time() if now is None else now
+        attempts, blocked = [], []
         with self.store.lock:
             data = self.store.load()
             changed = False
             for key in list(data):
                 entry = data[key]
-                if entry.get("wake_at", 0) > now:
+                if entry.get("status") == "blocked":
                     continue
-                ok = False
-                try:
-                    target = key[: -len(TEST_SUFFIX)] if key.endswith(TEST_SUFFIX) else key
-                    ok = bool(self.inject(self.s.resume_message, role="user", session_key=target))
-                except Exception:
-                    logger.warning("ratelimit-resume: inject failed for %s", key, exc_info=True)
-                if ok:
-                    logger.info("ratelimit-resume: resumed %s", key)
-                    self.notify(target, RESUMED_NOTICE)
-                    del data[key]
+                if entry.get("wake_at", 0) > now or entry.get("next_attempt_at", 0) > now:
+                    continue
+                target = key.removesuffix(TEST_SUFFIX)
+                confirmation_since = entry.get("dispatched_at", entry["wake_at"])
+                if now - confirmation_since > GIVE_UP_AFTER_SECONDS:
+                    entry["status"] = "blocked"
+                    blocked.append(target)
                     changed = True
-                elif now - entry["wake_at"] > GIVE_UP_AFTER_SECONDS:
-                    logger.warning("ratelimit-resume: giving up on %s after repeated inject failures", key)
-                    del data[key]
-                    changed = True
+                    continue
+                if entry.get("status") in ("dispatched", "running"):
+                    continue
+                entry.setdefault("attempt_id", uuid.uuid4().hex)  # older durable records
+                entry.update(status="submitted", attempted_at=now,
+                             next_attempt_at=now + ACK_WAIT_SECONDS,
+                             attempts=entry.get("attempts", 0) + 1)
+                attempts.append((key, target, entry["attempt_id"]))
+                changed = True
             if changed:
                 self.store.save(data)
+        # Host callbacks may re-enter hooks; never hold the durable-state lock here.
+        for target in blocked:
+            logger.warning("ratelimit-resume: blocked without a receipt for %s; request retained", target)
+            self.notify(target, BLOCKED_NOTICE)
+        for key, target, attempt_id in attempts:
+            try:
+                message = self.s.resume_message + "\n[ratelimit-resume:" + attempt_id + "]"
+                accepted = bool(self.inject(message, role="user", session_key=target))
+            except Exception:
+                accepted = False
+                logger.warning("ratelimit-resume: inject failed for %s", key, exc_info=True)
+            if accepted:
+                logger.info("ratelimit-resume: submission queued for %s; awaiting dispatch/API receipt", target)
+                continue
+            with self.store.lock:
+                data = self.store.load()
+                entry = data.get(key)
+                if entry and entry.get("attempt_id") == attempt_id and entry.get("status") == "submitted":
+                    entry.update(status="waiting", next_attempt_at=now + TICK_SECONDS)
+                    self.store.save(data)
 
     def start(self) -> None:
         if not self.gateway or self._thread is not None:

@@ -6,6 +6,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -54,6 +55,25 @@ class Base(unittest.TestCase):
                     error={"type": "RateLimitError", "message": CODEX_TEXT})
         base.update(kw)
         self.p.on_api_error(**base)
+
+
+class RegistrationTests(unittest.TestCase):
+    def test_turn_receipt_hook_is_registered_without_starting_a_waker_in_cli(self):
+        import importlib.util
+        path = Path(resume.__file__).with_name('__init__.py')
+        spec = importlib.util.spec_from_file_location('resume_entry_fixture', path)
+        entry = importlib.util.module_from_spec(spec); spec.loader.exec_module(entry)
+        hooks, commands = {}, {}
+        context = SimpleNamespace(inject_message=lambda *a, **kw: True,
+            get_config=lambda key, default=None: default,
+            register_hook=lambda name, callback: hooks.update({name: callback}),
+            register_command=lambda name, callback, **kwargs: commands.update({name: callback}))
+        with mock.patch.object(entry, 'is_gateway_process', return_value=False):
+            entry.register(context)
+        self.assertIn('pre_llm_call', hooks)
+        self.assertEqual(hooks['pre_llm_call'], entry._PLUGIN.on_turn_start)
+        self.assertEqual(set(commands), {'ratelimit-test', 'ratelimit-status'})
+        self.assertIsNone(entry._PLUGIN._thread)
 
 
 class ParseTests(unittest.TestCase):
@@ -187,23 +207,158 @@ class TickTests(Base):
         self.store.arm("K", "S1", time.time() - 1, "test")
         self.p.tick()
         self.p.tick()
-        self.assertEqual(self.injected, [(resume.RESUME_MESSAGE, "K")])
-        self.assertEqual(self.notices, [("K", resume.RESUMED_NOTICE)])
-        self.assertEqual(self.store.load(), {})
+        self.assertEqual(len(self.injected), 1)
+        self.assertEqual(self.injected[0][1], "K")
+        self.assertTrue(self.injected[0][0].startswith(resume.RESUME_MESSAGE))
+        self.assertEqual(self.notices, [])
+        self.assertEqual(self.store.load()['K']['status'], 'submitted')
 
     def test_future_entry_waits(self):
         self.store.arm("K", "S1", time.time() + 100, "test")
         self.p.tick()
         self.assertEqual(self.injected, [])
 
-    def test_failed_inject_retries_then_gives_up(self):
+    def test_failed_inject_retries_then_retains_visible_failure(self):
         self.inject_ok = False
         wake = time.time() - 1
         self.store.arm("K", "S1", wake, "test")
         self.p.tick()
         self.assertIn("K", self.store.load())
         self.p.tick(now=wake + resume.GIVE_UP_AFTER_SECONDS + 1)
+        self.assertEqual(self.store.load()['K']['status'], 'blocked')
+        self.assertEqual(len(self.notices), 1)
+        count = len(self.injected)
+        self.p.tick(now=wake + resume.GIVE_UP_AFTER_SECONDS + 100)
+        self.assertEqual(len(self.injected), count)
+        self.assertEqual(len(self.notices), 1)
+
+    def receipt(self, key='K', session_id='S1', content=None, **changes):
+        event = SimpleNamespace(text=content or self.injected[-1][0], internal=True, source=None,
+            metadata={'hermes_plugin_id': 'ratelimit-resume', 'hermes_plugin_injection': True,
+                      'gateway_session_key': key, 'gateway_session_id': session_id})
+        for name, value in changes.items(): setattr(event, name, value)
+        return self.p.on_gateway_dispatch(event=event)
+
+    def test_gateway_queued_then_unroutable_retries_after_restart_without_success_notice(self):
+        now = time.time()
+        self.store.arm('K', 'S1', now - 1, 'rate_limit')
+        self.p.tick(now=now)  # True = accepted by host, then async routing fails.
+        self.assertIn('K', self.store.load())
+        self.assertEqual(self.notices, [])
+        again = resume.ResumePlugin(self.p.inject, resume.Store(self.store.path), True,
+                                    notify=lambda k, t: self.notices.append((k, t)))
+        again.tick(now=now + 1)
+        self.assertEqual(len(self.injected), 1)
+        again.tick(now=now + resume.ACK_WAIT_SECONDS + 1)
+        self.assertEqual(len(self.injected), 2)
+        self.assertEqual(self.notices, [])
+        self.assertIn('K', self.store.load())
+
+    def test_actual_dispatch_then_api_success_confirms_and_notifies_once(self):
+        now = time.time()
+        self.store.arm('K', 'S1', now - 1, 'rate_limit')
+        self.p.tick(now=now)
+        self.assertIsNone(self.receipt())
+        self.assertEqual(self.store.load()['K']['status'], 'dispatched')
+        self.assertEqual(self.notices, [])
+        self.p.tick(now=now + resume.ACK_WAIT_SECONDS + 1)
+        self.assertEqual(len(self.injected), 1, 'do not inject again while a received turn runs')
+        self.p.on_turn_start(session_id='S1', user_message=self.injected[-1][0], turn_id='R1', task_id='T1')
+        self.p.on_api_success(session_id='S1', turn_id='R1', task_id='T1')
+        self.p.on_api_success(session_id='S1', turn_id='R1', task_id='T1')
         self.assertEqual(self.store.load(), {})
+        self.assertEqual(self.notices, [('K', resume.RESUMED_NOTICE)])
+
+    def test_ingress_receipt_does_not_misattribute_another_active_turns_api_response(self):
+        self.store.arm('K', 'S1', time.time() - 1, 'rate_limit')
+        self.p.tick()
+        self.receipt()
+        self.p.on_api_success(session_id='S1', turn_id='OLD', task_id='OLD_TASK')
+        self.assertIn('K', self.store.load())
+        self.assertEqual(self.notices, [])
+        self.p.on_turn_start(session_id='S1', user_message=self.injected[-1][0], turn_id='NEW', task_id='NEW_TASK')
+        self.p.on_api_success(session_id='S1', turn_id='OLD', task_id='OLD_TASK')
+        self.assertIn('K', self.store.load())
+        self.p.on_api_success(session_id='S1', turn_id='NEW', task_id='NEW_TASK')
+        self.assertEqual(self.notices, [('K', resume.RESUMED_NOTICE)])
+
+    def test_test_slot_survives_prior_turns_api_success_until_its_own_turn_runs(self):
+        self.p._test_key = 'agent:main:discord:group:1:2'
+        self.p.cmd_test()
+        self.p.on_api_success(session_id='S1', turn_id='OLD')
+        self.assertIn(self.p._test_key + resume.TEST_SUFFIX, self.store.load())
+
+    def test_human_success_cancels_pending_without_claiming_auto_resume(self):
+        self.store.arm('K', 'S1', time.time() - 1, 'rate_limit')
+        self.p.tick()
+        old = self.injected[-1][0]
+        self.p.on_api_success(session_id='S1')
+        self.assertEqual(self.store.load(), {})
+        self.assertEqual(self.notices, [])
+        self.assertEqual(self.receipt(content=old)['action'], 'skip')
+
+    def test_rearmed_record_rejects_stale_queued_continuation(self):
+        self.store.arm('K', 'S1', time.time() - 1, 'rate_limit')
+        self.p.tick()
+        old = self.injected[-1][0]
+        self.store.arm('K', 'S1', time.time() + 300, 'rate_limit')
+        self.assertEqual(self.receipt(content=old)['action'], 'skip')
+        self.assertNotEqual(self.store.load()['K'].get('status'), 'dispatched')
+
+    def test_receipt_must_be_our_internal_event_with_matching_session(self):
+        self.store.arm('K', 'S1', time.time() - 1, 'rate_limit')
+        self.p.tick()
+        self.receipt(internal=False)
+        self.assertEqual(self.store.load()['K']['status'], 'submitted')
+        self.receipt(session_id='OTHER')
+        self.assertEqual(self.store.load()['K']['status'], 'submitted')
+        self.p.on_api_success(session_id='OTHER')
+        self.assertIn('K', self.store.load())
+
+    def test_inject_may_synchronously_acknowledge_without_lock_deadlock(self):
+        import threading
+        self.store.arm('K', 'S1', time.time() - 1, 'rate_limit')
+        def inject(content, **kwargs):
+            self.receipt(content=content)
+            self.p.on_turn_start(session_id='S1', user_message=content, turn_id='R1', task_id='T1')
+            self.p.on_api_success(session_id='S1', turn_id='R1', task_id='T1')
+            return True
+        self.p.inject = inject
+        worker = threading.Thread(target=self.p.tick, daemon=True)
+        worker.start(); worker.join(timeout=1)
+        self.assertFalse(worker.is_alive(), 'never hold the state lock across host callbacks')
+        self.assertEqual(self.store.load(), {})
+
+    def test_short_limit_after_dispatch_rearms_existing_pending_request(self):
+        key = 'agent:main:discord:group:1:2'
+        self.store.arm(key, 'S1', time.time() - 1, 'rate_limit')
+        self.p.tick()
+        self.receipt(key=key)
+        before = self.store.load()[key]['attempt_id']
+        self.error(error={'message': "'resets_in_seconds': 30"})
+        value = self.store.load()[key]
+        self.assertEqual(value['status'], 'waiting')
+        self.assertNotEqual(value['attempt_id'], before)
+        self.assertGreater(value['wake_at'], time.time())
+
+    def test_stalled_dispatch_is_retained_as_blocked_not_reinjected_forever(self):
+        now = time.time()
+        self.store.arm('K', 'S1', now - 1, 'rate_limit')
+        self.p.tick(now=now)
+        self.receipt()
+        self.p.tick(now=now + resume.GIVE_UP_AFTER_SECONDS + 1)
+        self.assertEqual(self.store.load()['K']['status'], 'blocked')
+        self.assertEqual(len(self.injected), 1)
+        self.assertEqual(self.notices, [('K', resume.BLOCKED_NOTICE)])
+
+    def test_late_reconnection_gets_a_full_confirmation_window_after_receipt(self):
+        now = time.time()
+        self.store.arm('K', 'S1', now - resume.GIVE_UP_AFTER_SECONDS + 1, 'rate_limit')
+        self.p.tick(now=now)
+        self.receipt()
+        self.p.tick(now=now + resume.ACK_WAIT_SECONDS + 1)
+        self.assertEqual(self.store.load()['K']['status'], 'dispatched')
+        self.assertEqual(self.notices, [])
 
     def test_state_survives_new_instance(self):
         self.error()
@@ -219,11 +374,11 @@ class CommandTests(Base):
             source = Src()
         class SS:
             def _generate_session_key(self, source):
-                return "agent:main:discord:group:9"
+                return "agent:main:discord:group:1:2"
         self.assertIsNone(self.p.on_gateway_dispatch(event=Ev(), session_store=SS()))
         msg = self.p.cmd_test("")
         self.assertIn("Test armed", msg)
-        self.assertIn("agent:main:discord:group:9#test", self.store.load())
+        self.assertEqual(self.store.load()['agent:main:discord:group:1:2#test']['session_id'], 'S1')
 
     def test_test_does_not_replace_real_resume(self):
         self.error()
@@ -234,7 +389,8 @@ class CommandTests(Base):
         data["agent:main:discord:group:1:2#test"]["wake_at"] = time.time() - 1
         self.store.save(data)
         self.p.tick()
-        self.assertEqual(self.injected, [(resume.RESUME_MESSAGE, "agent:main:discord:group:1:2")])
+        self.assertEqual(len(self.injected), 1)
+        self.assertEqual(self.injected[0][1], "agent:main:discord:group:1:2")
         self.assertIn("agent:main:discord:group:1:2", self.store.load())
 
     def test_status_and_clear(self):
