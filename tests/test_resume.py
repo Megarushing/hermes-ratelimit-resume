@@ -269,6 +269,20 @@ class TickTests(Base):
         self.assertEqual(self.store.load(), {})
         self.assertEqual(self.notices, [('K', resume.RESUMED_NOTICE)])
 
+    def test_turn_start_is_the_receipt_when_the_host_skips_dispatch_hooks_for_internal_events(self):
+        # Real gateway (run_inbound._hm_admit_event): internal events return before pre_gateway_dispatch.
+        now = time.time()
+        self.store.arm('K', 'S1', now - 1, 'rate_limit')
+        self.p.tick(now=now)
+        self.assertEqual(self.store.load()['K']['status'], 'submitted')
+        self.p.on_turn_start(session_id='S1', user_message=self.injected[-1][0], turn_id='R1', task_id='T1')
+        self.assertEqual(self.store.load()['K']['status'], 'running')
+        self.p.tick(now=now + resume.ACK_WAIT_SECONDS + 1)
+        self.assertEqual(len(self.injected), 1, 'a running resumed turn must not get a duplicate continue')
+        self.p.on_api_success(session_id='S1', turn_id='R1', task_id='T1')
+        self.assertEqual(self.store.load(), {})
+        self.assertEqual(self.notices, [('K', resume.RESUMED_NOTICE)])
+
     def test_ingress_receipt_does_not_misattribute_another_active_turns_api_response(self):
         self.store.arm('K', 'S1', time.time() - 1, 'rate_limit')
         self.p.tick()

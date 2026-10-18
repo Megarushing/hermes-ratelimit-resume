@@ -347,7 +347,9 @@ class ResumePlugin:
                     if not key.endswith(TEST_SUFFIX):
                         del data[key]
                         changed = True
-                elif (entry.get("attempt_id") in matches and entry.get("status") == "dispatched"
+                # "submitted" too: the gateway skips pre_gateway_dispatch for internal (injected)
+                # events, so on real hosts the turn start is the first receipt we ever see.
+                elif (entry.get("attempt_id") in matches and entry.get("status") in ("submitted", "dispatched")
                       and (turn_id or task_id)):
                     entry.update(status="running", turn_id=turn_id, task_id=task_id)
                     changed = True
