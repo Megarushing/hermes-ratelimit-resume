@@ -1,5 +1,5 @@
 name: ratelimit-resume
-version: 1.0.2
+version: 1.0.3
 manifest_version: 2
 api_version: 1
 description: Auto-continue a messaging-gateway chat when a provider usage limit resets.

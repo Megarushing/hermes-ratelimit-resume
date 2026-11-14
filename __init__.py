@@ -11,8 +11,13 @@ _PLUGIN = None
 
 def register(ctx) -> None:
     global _PLUGIN
+    try:
+        from hermes_constants import get_hermes_home
+        registration_home = get_hermes_home()
+    except ImportError:
+        registration_home = state_path().parent.parent
     _PLUGIN = ResumePlugin(ctx.inject_message, Store(state_path()), is_gateway_process(),
-                           settings=Settings(ctx.get_config))
+                           settings=Settings(ctx.get_config), registration_home=registration_home)
     ctx.register_hook("transform_api_error_classification", _PLUGIN.on_classify)
     ctx.register_hook("api_request_error", _PLUGIN.on_api_error)
     ctx.register_hook("pre_llm_call", _PLUGIN.on_turn_start)

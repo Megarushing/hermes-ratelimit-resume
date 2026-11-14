@@ -99,6 +99,14 @@ Logs: `grep ratelimit-resume ~/.hermes/logs/gateway.log`.
 - The notices use `hermes send`, which reads the bot token from the gateway's environment; it is
   launched from inside the gateway process.
 
+## Diagnosing rejected continuations
+
+`Automatic continuation could not be confirmed` means no matched continuation receipt arrived before the confirmation deadline; it does not by itself mean the reset-time parser failed. Inspect the host's admission logs first. For example, `belongs to profile None, not the plugin's profile None` is a host profile-ownership rejection before an agent turn starts.
+
+Version 1.0.3 adds local rejection diagnostics: registration-time profile home, current routing-process home, and the pending state's home. No prompt, credentials, or resumed message content is logged. The diagnostic helper is optional/fail-safe and never changes profile identity, retries through another profile, or bypasses host authorization. A missing helper is reported as unavailable. Logs contain filesystem paths; redact them before sharing publicly. Restart the gateway to load this diagnostic change; it is **not a claimed fix for an intermittent host profile mismatch**.
+
+The installed-host contract test now covers current synchronous session lookup/profile ownership, a mismatched-home rejection, asynchronous adapter unavailability, successful admission after recovery, and the matched API receipt. Run it against the exact installed Hermes revision after upgrades; the ordinary fixture-only suite cannot establish live SDK compatibility. A synthetic home mismatch reproduces the host warning, but does not establish the cause of an earlier live mismatch. Recovery without a code change is evidence of recovery, not a permanent repair.
+
 ## Tests
 
 ```sh

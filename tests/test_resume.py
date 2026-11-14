@@ -203,6 +203,28 @@ class ArmTests(Base):
 
 
 class TickTests(Base):
+    def test_rejection_reports_profile_context_without_message_content(self):
+        self.inject_ok = False
+        self.p.registration_home = str(self.home)
+        self.store.arm('K', 'S1', 100, 'rate_limit')
+        constants = SimpleNamespace(get_routing_process_hermes_home=lambda: self.home / 'other')
+        with mock.patch.dict(sys.modules, {'hermes_constants': constants}):
+            with self.assertLogs(resume.logger.name, level='WARNING') as logs:
+                self.p.tick(now=100)
+        text = '\n'.join(logs.output)
+        self.assertIn('submission rejected', text)
+        self.assertIn('registration_home=', text)
+        self.assertIn('routing_home=', text)
+        self.assertNotIn(self.p.s.resume_message, text)
+        self.assertEqual(self.store.load()['K']['status'], 'waiting')
+
+    def test_missing_diagnostic_api_does_not_break_retry(self):
+        self.inject_ok = False
+        self.store.arm('K', 'S1', 100, 'rate_limit')
+        with mock.patch.dict(sys.modules, {'hermes_constants': None}):
+            self.p.tick(now=100)
+        self.assertEqual(self.store.load()['K']['status'], 'waiting')
+
     def test_due_entry_injected_once(self):
         self.store.arm("K", "S1", time.time() - 1, "test")
         self.p.tick()

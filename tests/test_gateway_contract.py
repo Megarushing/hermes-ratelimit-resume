@@ -33,7 +33,8 @@ class GatewayContractTests(unittest.IsolatedAsyncioTestCase):
         key, sid = 'agent:main:telegram:dm:42', 'fixture-session'
         origin = SessionSource(platform=Platform.TELEGRAM, chat_id='42', chat_type='dm', user_id='42')
         entry = SimpleNamespace(origin=origin, session_id=sid)
-        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'HERMES_HOME': temp}):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'HERMES_HOME': temp}), \
+                patch('hermes_constants.get_routing_process_hermes_home', side_effect=lambda: Path(temp)):
             home = Path(temp)
             (home / 'config.yaml').write_text(json.dumps({'plugins': {'entries': {'ratelimit-resume': {'allow_gateway_injection': True}}}}))
             class Host(GatewayPluginInjectionMixin):
@@ -42,6 +43,8 @@ class GatewayContractTests(unittest.IsolatedAsyncioTestCase):
                     self._running, self._draining, self.available = True, False, False
                     self._background_tasks = set()
                     self.config = SimpleNamespace(multiplex_profiles=False)
+                    self._primary_profile_name = 'default'
+                    self.session_store = SimpleNamespace(lookup_by_session_key=lambda key: entry)
                     self.async_session_store = SimpleNamespace(lookup_by_session_key=AsyncMock(return_value=entry))
                     self.adapter = SimpleNamespace(handle_message=self.receive)
                     self.events = []
@@ -57,7 +60,7 @@ class GatewayContractTests(unittest.IsolatedAsyncioTestCase):
                     plugin.on_api_success(session_id=sid, turn_id='fixture-turn', task_id='fixture-task')
             self_outer = self
             host = Host()
-            manager = PluginManager()
+            manager = PluginManager(scope_key=str(home))
             manager.set_gateway_message_injector(host, host._schedule_plugin_message_injection)
             context = PluginContext(PluginManifest(name='ratelimit-resume', key='ratelimit-resume', source='user'), manager)
             notices = []
@@ -66,6 +69,15 @@ class GatewayContractTests(unittest.IsolatedAsyncioTestCase):
             now = time.time()
             store.arm(key, sid, now - 1, 'rate_limit')
             try:
+                # Exercise the real profile guard, not a permissive stub. Reproduce
+                # the observed None/None refusal under an explicit home mismatch.
+                with patch('hermes_constants.get_routing_process_hermes_home', return_value=home / 'other'):
+                    with self.assertLogs('gateway.run', level='WARNING') as logs:
+                        plugin.tick(now=now)
+                    self.assertIn('profile None', '\n'.join(logs.output))
+                self.assertFalse(host._background_tasks)
+                self.assertEqual(store.load()[key]['status'], 'waiting')
+                now += resume.TICK_SECONDS + 1
                 plugin.tick(now=now)
                 tasks = list(host._background_tasks)
                 self.assertTrue(tasks, 'actual SDK scheduling must return a task')

@@ -266,11 +266,12 @@ class Settings:
 
 class ResumePlugin:
     def __init__(self, inject, store: Store, gateway: bool, notify=send_notice,
-                 settings: Optional[Settings] = None):
+                 settings: Optional[Settings] = None, registration_home: Optional[Path] = None):
         self.s = settings or Settings()
         self.inject = inject
         self.notify = notify if self.s.notices else (lambda key, text: None)
         self.store = store
+        self.registration_home = str(registration_home or store.path.parent.parent)
         self.gateway = gateway
         self._stash_lock = threading.Lock()
         self._stash: dict = {}
@@ -452,6 +453,17 @@ class ResumePlugin:
             lines.append(f"- {key} → {when} ({v.get('reason')}, {v.get('status', 'waiting')})")
         return "Pending rate-limit resumes:\n" + "\n".join(lines)
 
+    def _log_submission_rejection(self) -> None:
+        # Diagnostic only: never change profile scope or bypass the host's guard.
+        try:
+            from hermes_constants import get_routing_process_hermes_home
+            routing_home = str(get_routing_process_hermes_home())
+        except Exception:
+            routing_home = '<unavailable>'
+        logger.warning(
+            'ratelimit-resume: submission rejected; registration_home=%s routing_home=%s state_home=%s',
+            self.registration_home, routing_home, self.store.path.parent.parent)
+
     # --- waker -----------------------------------------------------------
     def tick(self, now: Optional[float] = None) -> None:
         if not self.gateway:
@@ -498,6 +510,7 @@ class ResumePlugin:
             if accepted:
                 logger.info("ratelimit-resume: submission queued for %s; awaiting dispatch/API receipt", target)
                 continue
+            self._log_submission_rejection()
             with self.store.lock:
                 data = self.store.load()
                 entry = data.get(key)
