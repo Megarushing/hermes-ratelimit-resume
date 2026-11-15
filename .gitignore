@@ -1,2 +1,12 @@
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.hermes/
+state/
+*.log
+.pytest_cache/
+.coverage

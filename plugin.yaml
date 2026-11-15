@@ -15,8 +15,8 @@ provides_hooks:
   - pre_gateway_dispatch
 config_schema:
   platforms: {type: list, default: [], description: "Gateway platforms to auto-continue (e.g. [discord, telegram]). Empty = all messaging platforms."}
-  max_wait_hours: {type: float, default: 6, description: "Longest reset to wait for. Longer (e.g. weekly) limits are left alone."}
-  min_wait_seconds: {type: int, default: 600, description: "Shorter resets are left to Hermes' own retry, which already waits up to 600s."}
+  max_wait_hours: {type: float, default: 6, description: "Longest provider-reported reset to accept, before the margin. Longer limits are not parked."}
+  min_wait_seconds: {type: int, default: 600, description: "New resets at or below this threshold stay with Hermes; already-pending resumes may re-arm for shorter waits."}
   margin_seconds: {type: int, default: 60, description: "Continue this many seconds after the provider's stated reset."}
-  notices: {type: bool, default: true, description: "Post visible ⏸️/▶️ notices in the chat via `hermes send`."}
+  notices: {type: bool, default: true, description: "Send pause, confirmed-resume and blocked notices via `hermes send`. Does not silence the agent reply."}
   resume_message: {type: str, default: "Rate limit reset — continue where you stopped. Start your reply with \"▶️ *auto-continued*\".", description: "Text injected into the agent at wake-up (the chat never shows it)."}
